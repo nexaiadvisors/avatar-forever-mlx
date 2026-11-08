@@ -1,5 +1,8 @@
 # ltx-2-mlx
 
+> **This fork adds [Avatar-Forever](README-AVATAR-FOREVER.md)**: long, drift-free talking-head videos from one portrait, on Apple Silicon. See README-AVATAR-FOREVER.md.
+
+
 Pure MLX port of [LTX-2](https://github.com/Lightricks/LTX-2) for Apple Silicon. Three-package monorepo mirroring the reference structure — inference, pipelines, and training — running natively on Metal.
 
 ## Features

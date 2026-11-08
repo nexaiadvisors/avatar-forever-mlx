@@ -391,6 +391,9 @@ class LTXModelConfig:
     use_prompt_adaln_single: bool = True
     use_keyframes_abs_pos_embedding: bool = False
     double_precision_rope: bool = False
+    # Avatar-Forever (LTX-2.3 fine-tune): first-frame channel condition added after patchify_proj.
+    # None = absent (stock checkpoints); "add" or "gated" when the checkpoint has the projection.
+    video_channel_condition_mode: str | None = None
 
     @classmethod
     def from_checkpoint_config(cls, config: dict) -> LTXModelConfig:
@@ -447,6 +450,11 @@ class LTXModelConfig:
             use_prompt_adaln_single=t.get("use_prompt_adaln_single", d.use_prompt_adaln_single),
             use_keyframes_abs_pos_embedding=t.get("use_keyframes_abs_pos_embedding", d.use_keyframes_abs_pos_embedding),
             double_precision_rope=t.get("frequencies_precision", "") == "float64",
+            video_channel_condition_mode=(
+                t.get("video_channel_condition_mode", "add")
+                if t.get("video_channel_condition_in_channels", 0) > 0
+                else d.video_channel_condition_mode
+            ),
         )
 
     @classmethod
@@ -551,6 +559,15 @@ class LTXModel(nn.Module):
         if config.use_keyframes_abs_pos_embedding:
             self.keyframes_abs_pos_embedding = mx.zeros((1, vd))
 
+        # Avatar-Forever first-frame channel condition (absent on stock checkpoints). Modified by NexAI Advisors, 2026:
+        # ported from Avatar-Forever (LTX-2 Community License, see LICENSE-LTX-2).
+        if config.video_channel_condition_mode is not None:
+            self.video_channel_condition_proj = nn.Linear(config.video_patch_channels, vd, bias=False)
+            if config.video_channel_condition_mode == "gated":
+                self.video_channel_condition_gate = nn.Linear(vd, vd)
+        # Set per call by the Avatar-Forever AR loop: (B, Nv, video_patch_channels) or None.
+        self._video_channel_condition_input: mx.array | None = None
+
         # --- Timestep AdaLN (9-param: self-attn shift/scale/gate x3) ---
         self.adaln_single = AdaLayerNormSingle(vd, num_params=9, timestep_dim=t_dim)
         self.audio_adaln_single = AdaLayerNormSingle(ad, num_params=9, timestep_dim=t_dim)
@@ -594,6 +611,22 @@ class LTXModel(nn.Module):
 
         # Block-sparse video self-attention (Sol routing); None = dense. See set_sparse_attention.
         self._sparse_attention: SparseAttentionState | None = None
+
+    def _apply_video_channel_condition(self, video_hidden: mx.array) -> mx.array:
+        """Avatar-Forever: x += proj(cc) * 2*sigmoid(gate(proj(cc))) (gate only in "gated" mode).
+
+        Mirrors avatarforever ltx_core/model/transformer/transformer_args.py prepare(). No-op when the model
+        has no projection or no condition was set.
+        """
+        cc = self._video_channel_condition_input
+        if cc is None or not hasattr(self, "video_channel_condition_proj"):
+            return video_hidden
+        if cc.shape[:2] != video_hidden.shape[:2]:
+            raise ValueError(f"video channel condition {cc.shape} does not match video tokens {video_hidden.shape}")
+        c = self.video_channel_condition_proj(cc.astype(video_hidden.dtype))
+        if hasattr(self, "video_channel_condition_gate"):
+            c = c * (2.0 * mx.sigmoid(self.video_channel_condition_gate(c)))
+        return video_hidden + c
 
     @property
     def compute_dtype(self) -> mx.Dtype | None:
@@ -762,6 +795,7 @@ class LTXModel(nn.Module):
         video_hidden = apply_keyframes_absolute_embedding(
             video_hidden, video_keyframes_mask, getattr(self, "keyframes_abs_pos_embedding", None)
         )
+        video_hidden = self._apply_video_channel_condition(video_hidden)
         t_emb = self._embed_timestep_scalar(timestep)
 
         if video_timesteps is not None:
@@ -880,6 +914,7 @@ class LTXModel(nn.Module):
         video_hidden = apply_keyframes_absolute_embedding(
             video_hidden, video_keyframes_mask, getattr(self, "keyframes_abs_pos_embedding", None)
         )
+        video_hidden = self._apply_video_channel_condition(video_hidden)
         audio_hidden = self.audio_patchify_proj(audio_latent) if audio_latent is not None else None
 
         # --- Timestep embeddings ---
